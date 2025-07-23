@@ -1,70 +1,95 @@
 // Vercel-optimized OAuth Server - api/server.js
 const express = require('express');
 const session = require('express-session');
+const MemoryStore = require('memorystore')(session);
 const { google } = require('googleapis');
 const crypto = require('crypto');
 const cors = require('cors');
 
 const app = express();
 
-// For Vercel, we need to handle the serverless environment
+// Hardcoded configuration values
+const GOOGLE_CLIENT_ID = '1038292507497-dfm20rl60dc831no8qf6s4qdrmehhsbs.apps.googleusercontent.com';
+const GOOGLE_CLIENT_SECRET = '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';
+const SESSION_SECRET = '61a3020134061725b19fd4d2ac3f825713ec95cf4259f3ce65d121792be25188';
+const SERVER_URL = 'https://cuddly-space-garbanzo-w4xppw65qw42gqww-3000.app.github.dev';
+const NODE_ENV = 'development';
+const PORT = 3000;
+
 const isVercel = process.env.VERCEL || process.env.NOW_REGION;
 
-// In-memory store for temporary auth data 
-// Note: In production with Vercel, consider using Upstash Redis or similar
 const authStore = new Map();
 
-// Google OAuth2 configuration
 const oauth2Client = new google.auth.OAuth2(
-  process.env.GOOGLE_CLIENT_ID,
-  process.env.GOOGLE_CLIENT_SECRET,
-  `${process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : process.env.SERVER_URL}/auth/google/callback`
+  GOOGLE_CLIENT_ID,
+  GOOGLE_CLIENT_SECRET,
+  (process.env.VERCEL_URL ? 'https://' + process.env.VERCEL_URL : SERVER_URL) + '/auth/google/callback'
 );
 
-// CORS configuration for Vercel
-app.use(cors({
-  origin: [
-    'https://www.figma.com',
-    'https://figma.com',
-    process.env.SERVER_URL,
-    process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : null
-  ].filter(Boolean),
-  credentials: true,
-  methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'Cookie']
-}));
+app.set('trust proxy', true);
 
-// Session configuration for Vercel
 app.use(session({
-  secret: process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex'),
+  store: new MemoryStore({
+    checkPeriod: 86400000
+  }),
+  secret: SESSION_SECRET,
   resave: false,
-  saveUninitialized: false,
+  saveUninitialized: true,
   cookie: {
-    secure: true, // Always use secure cookies on Vercel
+    secure: NODE_ENV === 'production',
     httpOnly: true,
-    maxAge: 24 * 60 * 60 * 1000, // 24 hours
-    sameSite: 'none' // Required for cross-origin cookies
+    maxAge: 24 * 60 * 60 * 1000,
+    sameSite: 'lax'
   }
 }));
 
+app.use(cors({
+  origin: (origin, callback) => {
+    console.log('CORS check:', { origin, allowed: true });
+    callback(null, origin === 'null' || !origin ? true : origin);
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'Cookie'],
+  exposedHeaders: ['Access-Control-Allow-Origin']
+}));
+
+app.options('*', cors(), (req, res) => {
+  console.log('Handling OPTIONS:', { path: req.path, origin: req.headers.origin });
+  res.set({
+    'Access-Control-Allow-Origin': req.headers.origin || 'null',
+    'Access-Control-Allow-Credentials': 'true',
+    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type,Authorization,Cookie'
+  }).status(204).send();
+});
+
+app.use((req, res, next) => {
+  console.log('Request received:', {
+    method: req.method,
+    path: req.path,
+    headers: req.headers,
+    sessionId: req.session?.id || 'No session',
+    cookies: req.headers.cookie || 'No cookies'
+  });
+  next();
+});
+
 app.use(express.json());
 
-// Generate read/write key pairs for secure OAuth flow
 function generateKeyPair() {
   const readKey = crypto.randomBytes(32).toString('hex');
   const writeKey = crypto.randomBytes(32).toString('hex');
   return { readKey, writeKey };
 }
 
-// Utility function to get server URL
 function getServerUrl() {
   if (process.env.VERCEL_URL) {
-    return `https://${process.env.VERCEL_URL}`;
+    return 'https://' + process.env.VERCEL_URL;
   }
-  return process.env.SERVER_URL || 'http://localhost:3000';
+  return SERVER_URL;
 }
 
-// Root endpoint
 app.get('/', (req, res) => {
   res.json({
     message: 'Figma Plugin OAuth Server',
@@ -74,42 +99,49 @@ app.get('/', (req, res) => {
   });
 });
 
-// Health check endpoint
 app.get('/api/health', (req, res) => {
   res.json({ 
     status: 'ok', 
     timestamp: new Date().toISOString(),
-    environment: process.env.NODE_ENV || 'development'
+    environment: NODE_ENV
   });
 });
 
-// Start OAuth flow
 app.get('/auth/google', (req, res) => {
   try {
-    const { origin } = req.query;
+    const { origin, sessionId } = req.query;
     
-    // Generate key pair for this auth session
+    if (!sessionId) {
+      console.error('Missing sessionId in /auth/google');
+      return res.status(400).send('Missing sessionId parameter');
+    }
+    
     const { readKey, writeKey } = generateKeyPair();
     
-    // Store the write key in session for verification later
     req.session.writeKey = writeKey;
     req.session.origin = origin;
+    req.session.clientSessionId = sessionId;
     
-    // Store the key pair in our temporary store
+    console.log('Starting OAuth flow:', {
+      sessionId: req.session.id,
+      clientSessionId: sessionId,
+      writeKey,
+      origin,
+      cookie: req.headers.cookie || 'No cookie'
+    });
+    
     authStore.set(writeKey, {
       readKey,
       writeKey,
+      clientSessionId: sessionId,
       timestamp: Date.now(),
       sessionId: req.session.id
     });
     
-    // Clean up old entries (older than 10 minutes)
     cleanupAuthStore();
     
-    // Update OAuth callback URL for current deployment
-    oauth2Client.redirectUri = `${getServerUrl()}/auth/google/callback`;
+    oauth2Client.redirectUri = getServerUrl() + '/auth/google/callback';
     
-    // Generate OAuth URL with state parameter containing write key
     const authUrl = oauth2Client.generateAuthUrl({
       access_type: 'offline',
       scope: [
@@ -117,10 +149,10 @@ app.get('/auth/google', (req, res) => {
         'https://www.googleapis.com/auth/userinfo.email'
       ],
       state: writeKey,
-      prompt: 'consent' // Force consent screen for refresh tokens
+      prompt: 'consent'
     });
     
-    console.log('Starting OAuth flow with write key:', writeKey);
+    console.log('Redirecting to OAuth URL:', authUrl);
     res.redirect(authUrl);
     
   } catch (error) {
@@ -137,10 +169,19 @@ app.get('/auth/google', (req, res) => {
   }
 });
 
-// OAuth callback
 app.get('/auth/google/callback', async (req, res) => {
   try {
     const { code, state: writeKey, error } = req.query;
+    
+    console.log('Callback received:', {
+      sessionId: req.session?.id || 'No session',
+      sessionWriteKey: req.session?.writeKey || 'No writeKey',
+      providedWriteKey: writeKey,
+      clientSessionId: req.session?.clientSessionId || 'No clientSessionId',
+      code,
+      error,
+      cookie: req.headers.cookie || 'No cookie'
+    });
     
     if (error) {
       console.error('OAuth error:', error);
@@ -162,7 +203,21 @@ app.get('/auth/google/callback', async (req, res) => {
             <h2 class="error">❌ Authentication Error</h2>
             <p>Error: ${error}</p>
             <p>Please close this window and try again in Figma.</p>
-            <button class="retry-btn" onclick="window.close()">Close Window</button>
+            <button class="retry-btn" onclick="attemptClose()">Close Window</button>
+            <p id="close-error" style="color: #ff9999; display: none;">Cannot close automatically. Please close this window manually.</p>
+            <script>
+              function attemptClose() {
+                console.log('Attempting to close window');
+                try {
+                  window.close();
+                  console.log('Window closed successfully');
+                } catch (e) {
+                  console.error('Failed to close window:', e);
+                  document.getElementById('close-error').style.display = 'block';
+                }
+              }
+              setTimeout(attemptClose, 3000);
+            </script>
           </body>
         </html>
       `);
@@ -175,28 +230,52 @@ app.get('/auth/google/callback', async (req, res) => {
           <body style="font-family: Arial, sans-serif; margin: 40px; text-align: center;">
             <h2>❌ Invalid Request</h2>
             <p>Missing authorization code or state parameter.</p>
-            <button onclick="window.close()" style="background: #0366d6; color: white; border: none; padding: 10px 20px; border-radius: 6px; margin-top: 20px;">Close Window</button>
+            <button onclick="attemptClose()" style="background: #0366d6; color: white; border: none; padding: 10px 20px; border-radius: 6px; margin-top: 20px;">Close Window</button>
+            <p id="close-error" style="color: #ff9999; display: none;">Cannot close automatically. Please close this window manually.</p>
+            <script>
+              function attemptClose() {
+                console.log('Attempting to close window');
+                try {
+                  window.close();
+                  console.log('Window closed successfully');
+                } catch (e) {
+                  console.error('Failed to close window:', e);
+                  document.getElementById('close-error').style.display = 'block';
+                }
+              }
+            </script>
           </body>
         </html>
       `);
     }
     
-    // Verify write key matches what we stored in session
-    if (req.session.writeKey !== writeKey) {
-      console.error('Write key mismatch:', { session: req.session.writeKey, provided: writeKey });
+    if (!req.session || req.session.writeKey !== writeKey) {
+      console.error('Write key mismatch:', { session: req.session?.writeKey || 'No session', provided: writeKey });
       return res.status(400).send(`
         <html>
           <head><title>Security Error</title></head>
           <body style="font-family: Arial, sans-serif; margin: 40px; text-align: center;">
             <h2>❌ Security Error</h2>
             <p>Invalid state parameter. This could indicate a security issue.</p>
-            <button onclick="window.close()" style="background: #d73a49; color: white; border: none; padding: 10px 20px; border-radius: 6px; margin-top: 20px;">Close Window</button>
+            <button onclick="attemptClose()" style="background: #d73a49; color: white; border: none; padding: 10px 20px; border-radius: 6px; margin-top: 20px;">Close Window</button>
+            <p id="close-error" style="color: #ff9999; display: none;">Cannot close automatically. Please close this window manually.</p>
+            <script>
+              function attemptClose() {
+                console.log('Attempting to close window');
+                try {
+                  window.close();
+                  console.log('Window closed successfully');
+                } catch (e) {
+                  console.error('Failed to close window:', e);
+                  document.getElementById('close-error').style.display = 'block';
+                }
+              }
+            </script>
           </body>
         </html>
       `);
     }
     
-    // Get the stored auth data
     const authData = authStore.get(writeKey);
     if (!authData) {
       return res.status(400).send(`
@@ -205,26 +284,113 @@ app.get('/auth/google/callback', async (req, res) => {
           <body style="font-family: Arial, sans-serif; margin: 40px; text-align: center;">
             <h2>⏰ Session Expired</h2>
             <p>Authentication session has expired. Please try again.</p>
-            <button onclick="window.close()" style="background: #0366d6; color: white; border: none; padding: 10px 20px; border-radius: 6px; margin-top: 20px;">Close Window</button>
+            <button onclick="attemptClose()" style="background: #0366d6; color: white; border: none; padding: 10px 20px; border-radius: 6px; margin-top: 20px;">Close Window</button>
+            <p id="close-error" style="color: #ff9999; display: none;">Cannot close automatically. Please close this window manually.</p>
+            <script>
+              function attemptClose() {
+                console.log('Attempting to close window');
+                try {
+                  window.close();
+                  console.log('Window closed successfully');
+                } catch (e) {
+                  console.error('Failed to close window:', e);
+                  document.getElementById('close-error').style.display = 'block';
+                }
+              }
+            </script>
+          </body>
+        </html>
+      `);
+    }
+    
+    if (authData.authenticated) {
+      console.log('Callback already processed for writeKey:', writeKey);
+      return res.send(`
+        <html>
+          <head>
+            <title>Authentication Already Completed</title>
+            <style>
+              body { 
+                font-family: Arial, sans-serif; 
+                margin: 40px; 
+                text-align: center; 
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                color: white;
+                min-height: 80vh;
+                display: flex;
+                flex-direction: column;
+                justify-content: center;
+                align-items: center;
+              }
+              .success-icon { font-size: 64px; margin-bottom: 20px; }
+              .close-btn { 
+                background: rgba(255,255,255,0.2); 
+                color: white; 
+                border: 2px solid rgba(255,255,255,0.3); 
+                padding: 12px 24px; 
+                border-radius: 8px; 
+                margin-top: 20px;
+                cursor: pointer; 
+                font-size: 16px;
+                backdrop-filter: blur(10px);
+                transition: all 0.3s ease;
+              }
+              .close-btn:hover {
+                background: rgba(255,255,255,0.3);
+                transform: translateY(-2px);
+              }
+            </style>
+          </head>
+          <body>
+            <div class="success-icon">✅</div>
+            <h1>Authentication Already Completed</h1>
+            <p>You have already authenticated. Please close this window and return to Figma.</p>
+            <p><strong>Write Key (if needed): ${writeKey}</strong></p>
+            <button class="close-btn" onclick="attemptClose()">Close Window</button>
+            <p id="close-error" style="color: #ff9999; display: none;">Cannot close automatically. Please close this window manually.</p>
+            <script>
+              function sendPostMessage() {
+                console.log('Attempting to send postMessage with writeKey: ${writeKey}');
+                try {
+                  window.opener?.postMessage({ type: 'auth-completed', writeKey: '${writeKey}' }, '*');
+                  window.top?.postMessage({ type: 'auth-completed', writeKey: '${writeKey}' }, '*');
+                  window.parent?.postMessage({ type: 'auth-completed', writeKey: '${writeKey}' }, '*');
+                  console.log('postMessage sent to opener, top, and parent');
+                } catch (e) {
+                  console.error('Failed to send postMessage:', e);
+                }
+              }
+              function attemptClose() {
+                console.log('Attempting to close window');
+                try {
+                  sendPostMessage();
+                  window.close();
+                  console.log('Window closed successfully');
+                } catch (e) {
+                  console.error('Failed to close window:', e);
+                  document.getElementById('close-error').style.display = 'block';
+                }
+              }
+              sendPostMessage();
+              setTimeout(sendPostMessage, 1000);
+              setTimeout(sendPostMessage, 3000);
+              setTimeout(attemptClose, 5000);
+            </script>
           </body>
         </html>
       `);
     }
     
     try {
-      // Update OAuth client redirect URI
-      oauth2Client.redirectUri = `${getServerUrl()}/auth/google/callback`;
+      oauth2Client.redirectUri = getServerUrl() + '/auth/google/callback';
       
-      // Exchange code for tokens
       const { tokens } = await oauth2Client.getToken(code);
       oauth2Client.setCredentials(tokens);
       
-      // Get user information
       const oauth2 = google.oauth2({ version: 'v2', auth: oauth2Client });
       const userInfoResponse = await oauth2.userinfo.get();
       const userInfo = userInfoResponse.data;
       
-      // Store the authentication result using write key
       authStore.set(writeKey, {
         ...authData,
         token: tokens.access_token,
@@ -282,6 +448,13 @@ app.get('/auth/google/callback', async (req, res) => {
                 background: rgba(255,255,255,0.3);
                 transform: translateY(-2px);
               }
+              .writekey { 
+                font-size: 14px; 
+                background: rgba(0,0,0,0.2); 
+                padding: 10px; 
+                border-radius: 6px; 
+                word-break: break-all;
+              }
             </style>
           </head>
           <body>
@@ -292,16 +465,36 @@ app.get('/auth/google/callback', async (req, res) => {
               <p>Email: ${userInfo.email}</p>
             </div>
             <p>You can now close this window and return to Figma.</p>
-            <button class="close-btn" onclick="window.close()">Close Window</button>
+            <p class="writekey">Write Key (if prompted in Figma): <strong>${writeKey}</strong></p>
+            <button class="close-btn" onclick="attemptClose()">Close Window</button>
+            <p id="close-error" style="color: #ff9999; display: none;">Cannot close automatically. Please close this window manually.</p>
             <script>
-              // Auto-close after 3 seconds
-              setTimeout(() => {
+              function sendPostMessage() {
+                console.log('Attempting to send postMessage with writeKey: ${writeKey}');
                 try {
-                  window.close();
-                } catch(e) {
-                  console.log('Could not auto-close window');
+                  window.opener?.postMessage({ type: 'auth-completed', writeKey: '${writeKey}' }, '*');
+                  window.top?.postMessage({ type: 'auth-completed', writeKey: '${writeKey}' }, '*');
+                  window.parent?.postMessage({ type: 'auth-completed', writeKey: '${writeKey}' }, '*');
+                  console.log('postMessage sent to opener, top, and parent');
+                } catch (e) {
+                  console.error('Failed to send postMessage:', e);
                 }
-              }, 3000);
+              }
+              function attemptClose() {
+                console.log('Attempting to close window');
+                try {
+                  sendPostMessage();
+                  window.close();
+                  console.log('Window closed successfully');
+                } catch (e) {
+                  console.error('Failed to close window:', e);
+                  document.getElementById('close-error').style.display = 'block';
+                }
+              }
+              sendPostMessage();
+              setTimeout(sendPostMessage, 1000);
+              setTimeout(sendPostMessage, 3000);
+              setTimeout(attemptClose, 5000);
             </script>
           </body>
         </html>
@@ -316,7 +509,20 @@ app.get('/auth/google/callback', async (req, res) => {
             <h2>❌ Authentication Failed</h2>
             <p>Failed to exchange authorization code for access token.</p>
             <p>Please close this window and try again.</p>
-            <button onclick="window.close()" style="background: #d73a49; color: white; border: none; padding: 10px 20px; border-radius: 6px; margin-top: 20px;">Close Window</button>
+            <button onclick="attemptClose()" style="background: #d73a49; color: white; border: none; padding: 10px 20px; border-radius: 6px; margin-top: 20px;">Close Window</button>
+            <p id="close-error" style="color: #ff9999; display: none;">Cannot close automatically. Please close this window manually.</p>
+            <script>
+              function attemptClose() {
+                console.log('Attempting to close window');
+                try {
+                  window.close();
+                  console.log('Window closed successfully');
+                } catch (e) {
+                  console.error('Failed to close window:', e);
+                  document.getElementById('close-error').style.display = 'block';
+                }
+              }
+            </script>
           </body>
         </html>
       `);
@@ -330,45 +536,78 @@ app.get('/auth/google/callback', async (req, res) => {
         <body style="font-family: Arial, sans-serif; margin: 40px; text-align: center;">
           <h2>❌ Server Error</h2>
           <p>An unexpected error occurred during authentication.</p>
-          <button onclick="window.close()" style="background: #d73a49; color: white; border: none; padding: 10px 20px; border-radius: 6px; margin-top: 20px;">Close Window</button>
-        </body>
-      </html>
-    `);
+          <button onclick="attemptClose()" style="background: #d73a49; color: white; border: none; padding: 10px 20px; border-radius: 6px; margin-top: 20px;">Close Window</button>
+          <p id="close-error" style="color: #ff9999; display: none;">Cannot close automatically. Please close this window manually.</p>
+          <script>
+            function attemptClose() {
+              console.log('Attempting to close window');
+              try {
+                window.close();
+                console.log('Window closed successfully');
+              } catch (e) {
+                console.error('Failed to close window:', e);
+                document.getElementById('close-error').style.display = 'block';
+              }
+            }
+          </script>
+        </html>
+      `);
   }
 });
 
-// Check authentication status (polling endpoint)
 app.get('/auth/check', (req, res) => {
   try {
-    const sessionId = req.session.id;
-    const writeKey = req.session.writeKey;
+    const { writeKey, sessionId } = req.query;
     
-    if (!writeKey) {
-      return res.json({ authenticated: false, message: 'No active session' });
+    res.set({
+      'Access-Control-Allow-Origin': req.headers.origin || 'null',
+      'Access-Control-Allow-Credentials': 'true'
+    });
+    
+    console.log('Auth check requested:', {
+      sessionId: req.session?.id || 'No session',
+      clientSessionId: sessionId,
+      writeKey,
+      cookie: req.headers.cookie || 'No cookie',
+      origin: req.headers.origin || 'No origin',
+      headers: req.headers,
+      status: 'Processing'
+    });
+    
+    if (!writeKey && !sessionId) {
+      console.log('Auth check response:', { authenticated: false, message: 'No writeKey or sessionId provided' });
+      return res.status(200).json({ authenticated: false, message: 'No writeKey or sessionId provided' });
     }
     
-    const authData = authStore.get(writeKey);
+    let authData = null;
+    if (writeKey) {
+      authData = authStore.get(writeKey);
+    } else if (sessionId) {
+      for (const [key, value] of authStore.entries()) {
+        if (value.clientSessionId === sessionId) {
+          authData = value;
+          break;
+        }
+      }
+    }
     
     if (!authData) {
-      return res.json({ authenticated: false, message: 'Session expired' });
+      console.log('Auth check response:', { authenticated: false, message: 'Session expired or invalid writeKey/sessionId' });
+      return res.status(200).json({ authenticated: false, message: 'Session expired or invalid writeKey/sessionId' });
     }
     
     if (authData.authenticated && authData.token) {
-      // Return the token and clean up
-      const result = {
+      const response = {
         authenticated: true,
         token: authData.token,
         userInfo: authData.userInfo
       };
-      
-      // Clean up the auth data after successful retrieval
-      authStore.delete(writeKey);
-      req.session.writeKey = null;
-      
-      return res.json(result);
+      console.log('Auth check response:', response);
+      return res.status(200).json(response);
     }
     
-    res.json({ authenticated: false, message: 'Authentication pending' });
+    console.log('Auth check response:', { authenticated: false, message: 'Authentication pending' });
+    res.status(200).json({ authenticated: false, message: 'Authentication pending' });
     
   } catch (error) {
     console.error('Error checking auth status:', error);
@@ -376,21 +615,45 @@ app.get('/auth/check', (req, res) => {
   }
 });
 
-// Logout endpoint
+app.post('/auth/cleanup', (req, res) => {
+  try {
+    const { writeKey, sessionId } = req.body;
+    let deleted = false;
+    if (writeKey && authStore.has(writeKey)) {
+      authStore.delete(writeKey);
+      console.log('Cleaned up auth data for writeKey:', writeKey);
+      deleted = true;
+    }
+    if (sessionId) {
+      for (const [key, value] of authStore.entries()) {
+        if (value.clientSessionId === sessionId) {
+          authStore.delete(key);
+          console.log('Cleaned up auth data for sessionId:', sessionId);
+          deleted = true;
+          break;
+        }
+      }
+    }
+    res.status(200).json({ success: deleted });
+  } catch (error) {
+    console.error('Error cleaning up auth data:', error);
+    res.status(500).json({ error: 'Failed to clean up auth data' });
+  }
+});
+
 app.post('/auth/logout', (req, res) => {
   req.session.destroy((err) => {
     if (err) {
       console.error('Error destroying session:', err);
       return res.status(500).json({ error: 'Failed to logout' });
     }
-    res.json({ success: true });
+    res.status(200).json({ success: true });
   });
 });
 
-// Utility function to clean up old auth store entries
 function cleanupAuthStore() {
   const now = Date.now();
-  const maxAge = 10 * 60 * 1000; // 10 minutes
+  const maxAge = 10 * 60 * 1000;
   
   for (const [key, value] of authStore.entries()) {
     if (now - value.timestamp > maxAge) {
@@ -399,25 +662,20 @@ function cleanupAuthStore() {
   }
 }
 
-// Clean up old entries periodically (but not on every request in serverless)
 if (!isVercel) {
   setInterval(cleanupAuthStore, 5 * 60 * 1000);
 }
 
-// Error handling middleware
 app.use((err, req, res, next) => {
   console.error('Server error:', err);
   res.status(500).json({ error: 'Internal server error' });
 });
 
-// Export for Vercel
 module.exports = app;
 
-// For local development
 if (!isVercel) {
-  const PORT = process.env.PORT || 3000;
-  app.listen(PORT, () => {
+  app.listen(PORT, '0.0.0.0', () => {
     console.log(`🚀 OAuth server running on port ${PORT}`);
-    console.log(`📝 Make sure to set up your environment variables`);
+    console.log(`📝 Server configured for local testing`);
   });
 }
